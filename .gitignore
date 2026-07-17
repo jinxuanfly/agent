@@ -1,0 +1,23 @@
+# API密钥文件（不要提交）
+keys.env
+*.csv
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 模型文件（大文件）
+*.pth
+*.npy
+
+# 虚拟环境
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# 实验结果
+results/
