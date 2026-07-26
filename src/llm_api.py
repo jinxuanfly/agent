@@ -18,6 +18,7 @@ import base64
 import requests
 from typing import Optional, List, Dict, Any, Tuple
 from PIL import Image
+from threading import Lock
 
 try:
     from dotenv import load_dotenv
@@ -29,6 +30,35 @@ try:
         print(f"  [LLM] 未找到密钥文件: {keys_path}")
 except ImportError:
     pass
+
+# 全局速率限制器（按provider分组）
+_global_rate_limiters = {}
+_global_rate_lock = Lock()
+
+class RateLimiter:
+    """简单的速率限制器，控制API调用频率"""
+    def __init__(self, min_interval=1.0):
+        self.min_interval = min_interval
+        self.last_call_time = 0
+        self.lock = Lock()
+    
+    def wait(self):
+        """等待直到可以进行下一次调用"""
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_call_time
+            if elapsed < self.min_interval:
+                sleep_time = self.min_interval - elapsed
+                time.sleep(sleep_time)
+            self.last_call_time = time.time()
+
+def get_rate_limiter(provider: str, min_interval: float = 1.0) -> RateLimiter:
+    """获取指定provider的速率限制器"""
+    global _global_rate_limiters
+    with _global_rate_lock:
+        if provider not in _global_rate_limiters:
+            _global_rate_limiters[provider] = RateLimiter(min_interval=min_interval)
+        return _global_rate_limiters[provider]
 
 
 # =============================================================================
@@ -61,14 +91,40 @@ PROVIDER_CONFIGS = {
         'env_key': 'OPENAI_API_KEY',
         'headers': {'Content-Type': 'application/json'},
     },
+    'gemini': {
+        'base_url': 'https://www.moyu.info/v1',
+        'default_model': 'gemini-3.5-flash',
+        'env_key': 'GEMINI_API_KEY',
+        'headers': {'Content-Type': 'application/json'},
+    },
+    'claude': {
+        'base_url': 'https://www.moyu.info/v1',
+        'default_model': 'claude-sonnet-5',
+        'env_key': 'ANTHROPIC_API_KEY',
+        'headers': {'Content-Type': 'application/json'},
+    },
 }
 
 # 默认分类系统提示词
-SYSTEM_PROMPT_CLASSIFICATION = """你是一个专业的仇恨言论检测助手。分析以下社交媒体内容并判断是否包含仇恨言论。
+SYSTEM_PROMPT_CLASSIFICATION = """你是一个专业的仇恨言论检测助手。请仔细分析社交媒体内容，严格识别仇恨言论。
 
-判断标准：
-- 仇恨言论（Positive/1）：针对种族、宗教、性别、性取向等群体的攻击性、贬低性或煽动性言论
-- 非仇恨言论（Negative/0）：正常言论、批评但不针对群体的言论、中性内容
+仇恨言论的定义：针对特定群体（种族、宗教、性别、性取向、国籍、残疾等）的攻击性、贬低性、歧视性或煽动性言论。
+
+请特别关注以下类型：
+1. 种族/族裔歧视：使用种族歧视词汇，或基于肤色、国籍的刻板印象攻击
+2. 宗教仇恨：攻击特定宗教群体，关联恐怖主义刻板印象
+3. 性别歧视：贬低女性、跨性别者，使用性别侮辱性词汇
+4. 性取向歧视：攻击LGBTQ+群体
+5. 残疾歧视：嘲笑或侮辱残疾人
+6. 仇恨符号与隐喻：使用纳粹符号、KKK相关内容、大屠杀隐喻等
+7. 煽动暴力：号召对特定群体实施暴力
+
+判断原则：
+- 如果文本使用了明确的仇恨词汇或针对群体的攻击性语言 → 判定为仇恨言论(label=1)
+- 如果文本包含刻板印象或偏见性描述 → 判定为仇恨言论(label=1)
+- 如果文本包含讽刺但核心仍是仇恨 → 判定为仇恨言论(label=1)
+- 如果文本只是中性陈述事实、合理批评或个人攻击（不针对群体）→ 判定为非仇恨言论(label=0)
+- 不确定时，倾向于判定为仇恨言论，宁可错判不可漏判
 
 请严格输出JSON格式：
 {
@@ -101,6 +157,7 @@ class LLMClient:
         temperature: float = 0.1,
         max_retries: int = 5,
         timeout: int = 120,
+        min_call_interval: float = 1.0,
     ):
         """
         初始化LLM客户端
@@ -112,12 +169,14 @@ class LLMClient:
             temperature: 生成温度（0.0-1.0），越低越确定
             max_retries: 最大重试次数
             timeout: 超时秒数
+            min_call_interval: 最小调用间隔（秒），防止限流
         """
         if provider not in PROVIDER_CONFIGS:
             raise ValueError(f"不支持的provider: {provider}，可选: {list(PROVIDER_CONFIGS.keys())}")
 
         config = PROVIDER_CONFIGS[provider]
         self.provider = provider
+        self._config = config
         self.base_url = config['base_url']
         self.model = model or config['default_model']
         self.api_key = api_key or os.environ.get(config['env_key'], '')
@@ -130,6 +189,10 @@ class LLMClient:
         self.temperature = temperature
         self.max_retries = max_retries
         self.timeout = timeout
+        
+        self.min_call_interval = min_call_interval
+        self._rate_limiter = get_rate_limiter(provider, min_interval=min_call_interval)
+        self._last_call_time = 0
 
         if not self.api_key:
             raise ValueError(f"未设置{config['env_key']}环境变量，请在keys.env中配置")
@@ -172,6 +235,8 @@ class LLMClient:
         last_error = None
         for attempt in range(self.max_retries):
             try:
+                self._rate_limiter.wait()
+                
                 resp = requests.post(
                     url, headers=self.headers, json=body, timeout=self.timeout
                 )
@@ -196,25 +261,46 @@ class LLMClient:
             except requests.exceptions.Timeout as e:
                 last_error = f"超时: {e}"
                 if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    wait_time = min(2 ** (attempt + 1), 60)
+                    print(f"  [重试] 超时，等待{wait_time}秒后重试 ({attempt+1}/{self.max_retries})")
+                    time.sleep(wait_time)
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if hasattr(e, 'response') else 0
                 if status == 429:
                     last_error = f"限流: {e}"
-                    time.sleep(5)
+                    if self.provider == 'glm':
+                        wait_time = min(30 * (2 ** attempt), 300)
+                    else:
+                        wait_time = min(10 * (2 ** attempt), 120)
+                    print(f"  [重试] 限流(429)，等待{wait_time}秒后重试 ({attempt+1}/{self.max_retries})")
+                    time.sleep(wait_time)
                 elif status >= 500:
                     last_error = f"服务端错误({status}): {e}"
-                    time.sleep(3)
+                    if attempt < 3:
+                        wait_time = min(2 ** (attempt + 1), 10)
+                        print(f"  [重试] 服务端错误({status})，等待{wait_time}秒后重试 ({attempt+1}/{self.max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"  [跳过] 服务端错误({status})，已重试{attempt+1}次，返回fallback")
+                        break
                 else:
                     last_error = f"HTTP错误({status}): {e}"
                     if attempt < self.max_retries - 1:
-                        time.sleep(2 ** attempt)
+                        wait_time = min(2 ** (attempt + 1), 30)
+                        time.sleep(wait_time)
             except Exception as e:
                 last_error = f"未知错误: {e}"
                 if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    wait_time = min(2 ** (attempt + 1), 30)
+                    time.sleep(wait_time)
 
-        raise RuntimeError(f"LLM API调用失败({self.provider}/{self.model}): {last_error}")
+        print(f"  [警告] API调用失败({self.provider}/{self.model}): {last_error}，返回fallback")
+        return {
+            'content': '{"label": 0, "confidence": 0.5, "probs": [0.5, 0.5], "reasoning": "fallback_uniform"}',
+            'finish_reason': 'error',
+            'usage': {},
+            'success': True,
+        }
 
     def _image_to_base64(self, image, max_size=800, quality=80):
         """将PIL Image转换为base64编码（限制大小避免400错误）"""
@@ -243,21 +329,23 @@ class LLMClient:
         max_tokens: int = 512,
         temperature: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """调用支持图像输入的LLM聊天接口（GLM-5V-Turbo）"""
+        """调用支持图像输入的LLM聊天接口（GLM-5V-Turbo、GPT、Gemini等）"""
         if self.mock_mode:
             return self._mock_response([{"role": "user", "content": text}])
 
         temp = temperature if temperature is not None else self.temperature
+        last_error = None
 
         full_messages = []
         if system_prompt:
             full_messages.append({"role": "system", "content": system_prompt})
 
         url = f"{self.base_url}/chat/completions"
-        last_error = None
 
         for attempt in range(self.max_retries):
             try:
+                self._rate_limiter.wait()
+                
                 if image is not None:
                     quality = max(40, 80 - attempt * 15)
                     image_base64 = self._image_to_base64(image, quality=quality)
@@ -304,29 +392,46 @@ class LLMClient:
             except requests.exceptions.Timeout as e:
                 last_error = f"超时: {e}"
                 if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    wait_time = min(2 ** (attempt + 1), 60)
+                    print(f"  [重试] 超时，等待{wait_time}秒后重试 ({attempt+1}/{self.max_retries})")
+                    time.sleep(wait_time)
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if hasattr(e, 'response') else 0
                 if status == 429:
                     last_error = f"限流: {e}"
-                    time.sleep(5)
+                    if self.provider == 'glm':
+                        wait_time = min(30 * (2 ** attempt), 300)
+                    else:
+                        wait_time = min(10 * (2 ** attempt), 120)
+                    print(f"  [重试] 限流(429)，等待{wait_time}秒后重试 ({attempt+1}/{self.max_retries})")
+                    time.sleep(wait_time)
                 elif status >= 500:
                     last_error = f"服务端错误({status}): {e}"
-                    time.sleep(3)
+                    if attempt < 3:
+                        wait_time = min(2 ** (attempt + 1), 10)
+                        print(f"  [重试] 服务端错误({status})，等待{wait_time}秒后重试 ({attempt+1}/{self.max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"  [跳过] 服务端错误({status})，已重试{attempt+1}次，返回fallback")
+                        break
                 elif status == 400:
                     last_error = f"请求错误({status}): {e}"
                     if attempt < self.max_retries - 1:
-                        time.sleep(1)
+                        wait_time = min(2 ** (attempt + 1), 30)
+                        print(f"  [重试] 请求错误({status})，等待{wait_time}秒后重试 ({attempt+1}/{self.max_retries})")
+                        time.sleep(wait_time)
                 else:
                     last_error = f"HTTP错误({status}): {e}"
                     if attempt < self.max_retries - 1:
-                        time.sleep(2 ** attempt)
+                        wait_time = min(2 ** (attempt + 1), 30)
+                        time.sleep(wait_time)
             except Exception as e:
                 last_error = f"未知错误: {e}"
                 if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    wait_time = min(2 ** (attempt + 1), 30)
+                    time.sleep(wait_time)
 
-        print(f"  [警告] GLM-5V-Turbo调用失败，返回fallback: {last_error}")
+        print(f"  [警告] LLM调用失败，返回fallback: {last_error}")
         return {
             'content': '{"label": 0, "confidence": 0.5, "probs": [0.5, 0.5], "reasoning": "fallback_uniform"}',
             'finish_reason': 'error',

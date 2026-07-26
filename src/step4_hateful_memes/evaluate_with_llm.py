@@ -410,19 +410,45 @@ class SmallEMNet(nn.Module):
 # =============================================================================
 
 class HatefulMemesDataset(Dataset):
-    """Hateful Memes 数据集（支持图像加载 + 分层抽样）"""
+    """Hateful Memes 数据集（支持图像加载 + 分层抽样 + Hugging Face回退）"""
     def __init__(self, split='train', max_samples=None, load_images=True, stratified=True):
         self.split = split
         self.max_samples = max_samples
         self.load_images = load_images
         self.stratified = stratified
-        json_path = os.path.join(DATA_DIR, f'{split}.jsonl')
-        if not os.path.exists(json_path):
-            json_path = os.path.join(DATA_DIR, f'{split}.json')
         self.data = []
-        with open(json_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                self.data.append(json.loads(line))
+        self.load_source = 'local'
+        
+        json_path = os.path.join(DATA_DIR, f'{split}.jsonl')
+        json_path_fallback = os.path.join(DATA_DIR, f'{split}.json')
+        
+        if os.path.exists(json_path):
+            with open(json_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    self.data.append(json.loads(line))
+        elif os.path.exists(json_path_fallback):
+            with open(json_path_fallback, 'r', encoding='utf-8') as f:
+                for line in f:
+                    self.data.append(json.loads(line))
+        else:
+            print(f"  [INFO] 本地文件不存在，尝试从Hugging Face加载 {split} 集...")
+            try:
+                from datasets import load_dataset
+                hf_split = 'validation' if split == 'dev' else split
+                ds = load_dataset("neuralcatcher/hateful_memes", split=hf_split)
+                self.data = []
+                for item in ds:
+                    self.data.append({
+                        'id': item['id'],
+                        'img': item['img'],
+                        'label': item['label'],
+                        'text': item['text']
+                    })
+                self.load_source = 'huggingface'
+                print(f"  [OK] 从Hugging Face加载了 {len(self.data)} 样本")
+            except Exception as e:
+                print(f"  [FAIL] Hugging Face加载失败: {e}")
+                raise
         
         if max_samples and max_samples < len(self.data):
             if self.stratified:
@@ -440,16 +466,18 @@ class HatefulMemesDataset(Dataset):
                     try:
                         self.images.append(Image.open(img_path).convert('RGB'))
                     except Exception as e:
-                        print(f"  [警告] 加载图像失败 {img_path}: {e}")
+                        print(f"  [WARN] Failed to load image {img_path}: {e}")
                         self.images.append(None)
                 else:
-                    print(f"  [警告] 图像不存在: {img_path}")
+                    print(f"  [WARN] Image not found: {img_path}")
                     self.images.append(None)
         
         label_counts = {0: self.labels.count(0), 1: self.labels.count(1)}
         total = len(self.data)
-        print(f"  [{split}] 加载 {total} 样本 (图像: {sum(1 for img in self.images if img is not None)}/{total})")
-        print(f"  [{split}] 标签分布: 0={label_counts[0]} ({label_counts[0]/total*100:.1f}%), 1={label_counts[1]} ({label_counts[1]/total*100:.1f}%)")
+        img_ok = sum(1 for img in self.images if img is not None)
+        print(f"  [{split}] Loaded {total} samples (source: {self.load_source})")
+        print(f"  [{split}] Images: {img_ok}/{total}")
+        print(f"  [{split}] Labels: 0={label_counts[0]} ({label_counts[0]/total*100:.1f}%), 1={label_counts[1]} ({label_counts[1]/total*100:.1f}%)")
     
     def _stratified_sample(self, data, max_samples):
         """分层抽样：按label等比例采样，确保标签分布均匀"""
@@ -551,19 +579,28 @@ class ImageEncoder:
                 image_features = self.clip_model.encode_image(image_input)
             
             candidate_descriptions = [
-                "hateful content", "offensive image", "racist symbol",
-                "normal content", "neutral image", "funny meme",
                 "group of people", "single person", "cartoon character",
                 "text only", "image with text", "political meme",
-                "violent scene", "hate speech", "discrimination",
-                "homophobic content", "sexist image", "antisemitic symbol",
                 "protest image", "celebrity photo", "animal picture",
                 "nature landscape", "sports image", "food picture",
                 "meme format", "satire", "irony", "propaganda",
                 "historical figure", "religious symbol", "national flag",
                 "police image", "military", "firearm", "weapon",
                 "graffiti", "artwork", "illustration", "photograph",
-                "screenshot", "news clip", "advertisement", "poster"
+                "screenshot", "news clip", "advertisement", "poster",
+                "smiling face", "angry expression", "sad person",
+                "happy crowd", "protesting people", "marching group",
+                "holding sign", "raising fist", "waving flag",
+                "celebration", "riot", "peaceful gathering",
+                "building exterior", "interior room", "street scene",
+                "park", "beach", "mountain", "forest",
+                "city skyline", "countryside", "desert", "ocean",
+                "sunny day", "night scene", "rainy weather", "snowy",
+                "colorful image", "black and white", "dark mood", "bright",
+                "portrait", "landscape", "close up", "wide shot",
+                "famous landmark", "unknown location", "urban setting", "rural",
+                "text overlay", "caption", "title", "subtitle",
+                "symbolic image", "abstract art", "realistic photo", "sketch"
             ]
             
             text_inputs = clip.tokenize(candidate_descriptions).to(self.device)
@@ -631,6 +668,8 @@ def run_llm_evaluation(
     batch_size=8,
     save_cache=True,
     force_rerun_agent=None,
+    skip_llm_inference=False,
+    skip_agent=None,
 ):
     """
     LLM增强的Hateful Memes评估管线（异构多模态版本）
@@ -650,6 +689,7 @@ def run_llm_evaluation(
         enable_emnet: 是否启用EMNet纠偏
         batch_size: LLM API并发批次大小
         save_cache: 是否保存LLM输出缓存
+        skip_llm_inference: 是否跳过LLM推理（直接使用缓存）
     """
     print("=" * 70)
     print("LLM增强的 Hateful Memes 评估管线（异构多模态）")
@@ -661,19 +701,18 @@ def run_llm_evaluation(
     print(f"  Train/Val: {max_train}/{max_val}")
     print(f"  GAT: {'启用' if train_gat else '禁用'}")
     print(f"  EMNet: {'启用' if enable_emnet else '禁用'}")
+    print(f"  跳过LLM推理: {'是' if skip_llm_inference else '否'}")
     print()
 
-    # ========== 1. 数据加载 ==========
+    # ========== 1. 数据加载（仅加载文本和标签，不加载图像） ==========
     print("[1] 加载数据...")
-    train_dataset = HatefulMemesDataset(split='train', max_samples=max_train, load_images=True)
-    val_dataset = HatefulMemesDataset(split='dev', max_samples=max_val, load_images=True)
+    train_dataset = HatefulMemesDataset(split='train', max_samples=max_train, load_images=False)
+    val_dataset = HatefulMemesDataset(split='dev', max_samples=max_val, load_images=False)
 
     train_texts = train_dataset.texts
     train_labels = train_dataset.labels
-    train_images = train_dataset.images
     val_texts = val_dataset.texts
     val_labels = val_dataset.labels
-    val_images = val_dataset.images
 
     train_labels_t = torch.tensor(train_labels)
     val_labels_t = torch.tensor(val_labels)
@@ -701,53 +740,64 @@ def run_llm_evaluation(
     check_label_distribution(train_labels, "训练集")
     check_label_distribution(val_labels, "验证集")
 
-    # ========== 1.5 图像编码（生成图像描述） ==========
-    print("\n[1.5] 初始化图像编码器...")
-    image_encoder = ImageEncoder(use_clip=True, device=DEVICE)
-    
-    print("  生成训练集图像描述...")
-    train_image_descriptions = image_encoder.encode_batch(train_images)
-    
-    print("  生成验证集图像描述...")
-    val_image_descriptions = image_encoder.encode_batch(val_images)
+    if not skip_llm_inference:
+        # ========== 1.5 图像编码（生成图像描述） ==========
+        print("\n[1.5] 初始化图像编码器...")
+        train_dataset_with_images = HatefulMemesDataset(split='train', max_samples=max_train, load_images=True)
+        val_dataset_with_images = HatefulMemesDataset(split='dev', max_samples=max_val, load_images=True)
+        train_images = train_dataset_with_images.images
+        val_images = val_dataset_with_images.images
+        
+        image_encoder = ImageEncoder(use_clip=True, device=DEVICE)
+        
+        print("  生成训练集图像描述...")
+        train_image_descriptions = image_encoder.encode_batch(train_images)
+        
+        print("  生成验证集图像描述...")
+        val_image_descriptions = image_encoder.encode_batch(val_images)
 
-    # ========== 2. 创建LLM Agent（异构多模态） ==========
-    print("\n[2] 创建LLM Agent...")
-    
-    # 检测API key配置
-    providers = [provider1, provider2, provider3]
-    agent_names = ["Agent1(文本专家)", "Agent2(图像专家)", "Agent3(跨模态)"]
-    agent_prompts = ["text_focused", "image_focused", "multimodal_fusion"]
-    
-    agents = []
-    for i, (prov, name, prompt_key) in enumerate(zip(providers, agent_names, agent_prompts)):
-        client = LLMClient(
-            provider=prov,
-            temperature=0.1,
-            max_retries=5,
-            timeout=120,
-        )
-        use_direct_image = (i == 1 and prov == 'glm')
-        agent = LLMAgent(
-            client=client,
-            name=name,
-            system_prompt=AGENT_PROMPTS.get(prompt_key),
-            embed_dim=256,
-            num_classes=NUM_CLASSES,
-            use_image=(i >= 2),
-            use_direct_image=use_direct_image,
-            verbose=True,
-        )
-        agents.append(agent)
-        mode_str = "[模拟]" if client.mock_mode else "[API]"
-        image_mode = "[直接图像]" if use_direct_image else "[图像描述]" if i >= 1 else "[仅文本]"
-        print(f"  {name:<25s}: {prov}/{client.model} {mode_str} {image_mode}")
+        # ========== 2. 创建LLM Agent（异构多模态） ==========
+        print("\n[2] 创建LLM Agent...")
+        
+        # 检测API key配置
+        providers = [provider1, provider2, provider3]
+        agent_names = ["Agent1(文本专家)", "Agent2(图像专家)", "Agent3(跨模态)"]
+        agent_prompts = ["text_focused", "image_focused", "multimodal_fusion"]
+        
+        agents = []
+        for i, (prov, name, prompt_key) in enumerate(zip(providers, agent_names, agent_prompts)):
+            client = LLMClient(
+                provider=prov,
+                temperature=0.1,
+                max_retries=12,
+                timeout=180,
+                min_call_interval=0.0,
+            )
+            use_direct_image = (i >= 1 and prov in ['glm', 'gpt', 'gemini'])
+            use_image_for_agent = (i >= 1)
+            agent = LLMAgent(
+                client=client,
+                name=name,
+                system_prompt=AGENT_PROMPTS.get(prompt_key),
+                embed_dim=256,
+                num_classes=NUM_CLASSES,
+                use_image=use_image_for_agent,
+                use_direct_image=use_direct_image,
+                verbose=True,
+            )
+            agents.append(agent)
+            mode_str = "[模拟]" if client.mock_mode else "[API]"
+            image_mode = "[直接图像]" if use_direct_image else "[图像描述]" if use_image_for_agent else "[仅文本]"
+            print(f"  {name:<25s}: {prov}/{client.model} {mode_str} {image_mode}")
 
     # ========== 3. 训练集：LLM推理（异构多模态） ==========
     print(f"\n[3] 训练集LLM推理 ({B_train}样本)...")
-    print(f"  第一次Agent调用可能较慢（API预热）...")
-    print(f"  ★ 如果提示未设置API key，将使用模拟模式")
-    print(f"  ★ 异构多模态策略: Agent1=文本, Agent2=图像, Agent3=文本+图像")
+    if skip_llm_inference:
+        print(f"  ★ 跳过LLM推理，直接使用缓存")
+    else:
+        print(f"  第一次Agent调用可能较慢（API预热）...")
+        print(f"  ★ 如果提示未设置API key，将使用模拟模式")
+        print(f"  ★ 异构多模态策略: Agent1=文本, Agent2=图像, Agent3=文本+图像")
     
     all_train_alphas = torch.zeros(B_train, 3, NUM_CLASSES)
     all_train_beliefs = torch.zeros(B_train, 3, NUM_CLASSES)
@@ -777,7 +827,23 @@ def run_llm_evaluation(
     for i, agent in enumerate(agents):
         agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_train_agent{i}.pt')
         force_rerun = force_rerun_agent is not None and i == force_rerun_agent
+        skip_current = skip_agent is not None and i == skip_agent
         
+        if skip_current:
+            print(f"\n  [跳过] {agent.name} - 使用中性占位数据")
+            all_train_beliefs[:, i] = torch.tensor([[0.5, 0.5]] * B_train)
+            all_train_alphas[:, i] = torch.zeros(B_train, NUM_CLASSES)
+            all_train_uncertainties[:, i] = torch.tensor([1.0] * B_train)
+            all_train_embs[:, i] = torch.zeros(B_train, 256)
+            if save_cache:
+                torch.save({
+                    'alphas': all_train_alphas[:, i],
+                    'beliefs': all_train_beliefs[:, i],
+                    'uncertainties': all_train_uncertainties[:, i],
+                    'embs': all_train_embs[:, i],
+                }, agent_cache_path)
+            continue
+            
         if os.path.exists(agent_cache_path) and save_cache and not force_rerun:
             print(f"\n  加载缓存的 {agent.name} 输出...")
             cached_agent = torch.load(agent_cache_path, map_location='cpu')
@@ -803,7 +869,7 @@ def run_llm_evaluation(
                 if agent.use_direct_image:
                     alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image=train_images[idx])
                 else:
-                    alpha, belief, uncertainty, emb = agent.forward("", image_description=train_image_descriptions[idx])
+                    alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image_description=train_image_descriptions[idx])
             else:
                 alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image_description=train_image_descriptions[idx])
             all_train_alphas[idx, i] = alpha
@@ -1035,7 +1101,23 @@ def run_llm_evaluation(
     for i, agent in enumerate(agents):
         agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_val_agent{i}.pt')
         force_rerun = force_rerun_agent is not None and i == force_rerun_agent
+        skip_current = skip_agent is not None and i == skip_agent
         
+        if skip_current:
+            print(f"\n  [跳过] {agent.name} 验证集 - 使用中性占位数据")
+            all_val_beliefs[:, i] = torch.tensor([[0.5, 0.5]] * B_val)
+            all_val_alphas[:, i] = torch.zeros(B_val, NUM_CLASSES)
+            all_val_uncertainties[:, i] = torch.tensor([1.0] * B_val)
+            all_val_embs[:, i] = torch.zeros(B_val, 256)
+            if save_cache:
+                torch.save({
+                    'alphas': all_val_alphas[:, i],
+                    'beliefs': all_val_beliefs[:, i],
+                    'uncertainties': all_val_uncertainties[:, i],
+                    'embs': all_val_embs[:, i],
+                }, agent_cache_path)
+            continue
+            
         if os.path.exists(agent_cache_path) and save_cache and not force_rerun:
             print(f"\n  加载缓存的 {agent.name} 验证集输出...")
             cached_agent = torch.load(agent_cache_path, map_location='cpu')
@@ -1061,7 +1143,7 @@ def run_llm_evaluation(
                 if agent.use_direct_image:
                     alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image=val_images[idx])
                 else:
-                    alpha, belief, uncertainty, emb = agent.forward("", image_description=val_image_descriptions[idx])
+                    alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image_description=val_image_descriptions[idx])
             else:
                 alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image_description=val_image_descriptions[idx])
             all_val_alphas[idx, i] = alpha
@@ -1492,6 +1574,9 @@ if __name__ == '__main__':
     parser.add_argument('--force_rerun_agent', type=int, default=None,
                         choices=[0, 1, 2],
                         help='强制重新运行指定Agent（0=Agent1, 1=Agent2, 2=Agent3）')
+    parser.add_argument('--skip_agent', type=int, default=None,
+                        choices=[0, 1, 2],
+                        help='跳过指定Agent，用中性占位数据填充（0=Agent1, 1=Agent2, 2=Agent3）')
 
     args = parser.parse_args()
 
@@ -1527,4 +1612,5 @@ if __name__ == '__main__':
             batch_size=args.batch_size,
             save_cache=not args.no_cache,
             force_rerun_agent=args.force_rerun_agent,
+            skip_agent=args.skip_agent,
         )
