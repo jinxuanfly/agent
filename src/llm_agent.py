@@ -17,6 +17,7 @@ from typing import Optional, List, Dict, Any, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm_api import LLMClient, BatchClassifier, PROVIDER_CONFIGS
 
@@ -431,7 +432,7 @@ class BatchLLMProcessor:
         image_descriptions: Optional[List[str]] = None,
     ):
         """
-        批量处理，返回与现有评估管线兼容的输出
+        批量处理（★ 并行版），返回与现有评估管线兼容的输出
         
         Returns:
             all_alphas: [B, N, C]
@@ -450,29 +451,59 @@ class BatchLLMProcessor:
         all_embs = torch.zeros(B, N, D)
         all_preds = torch.zeros(B, dtype=torch.long)
         
-        for i, agent in enumerate(self.agents):
-            if self.verbose:
-                print(f"\n  运行 {agent.name} ({agent.client.provider}/{agent.client.model})...")
+        def _run_single_agent(i_agent):
+            """在独立线程中运行一个Agent的全部推理"""
+            i, agent = i_agent
+            local_alphas = torch.zeros(B, self.num_classes)
+            local_beliefs = torch.zeros(B, self.num_classes)
+            local_uncertainties = torch.zeros(B)
+            local_embs = torch.zeros(B, D)
             
-            for b in range(0, B, self.batch_size):
-                batch_end = min(b + self.batch_size, B)
-                batch_indices = list(range(b, batch_end))
-                
-                for idx in batch_indices:
-                    text = texts[idx]
-                    img_desc = image_descriptions[idx] if image_descriptions else None
+            try:
+                for b in range(0, B, self.batch_size):
+                    batch_end = min(b + self.batch_size, B)
+                    batch_indices = list(range(b, batch_end))
                     
-                    alpha, belief, uncertainty, emb = agent.forward(
-                        text=text, image_description=img_desc,
-                    )
+                    for idx in batch_indices:
+                        text = texts[idx]
+                        img_desc = image_descriptions[idx] if image_descriptions else None
+                        
+                        alpha, belief, uncertainty, emb = agent.forward(
+                            text=text, image_description=img_desc,
+                        )
+                        
+                        local_alphas[idx] = alpha
+                        local_beliefs[idx] = belief
+                        local_uncertainties[idx] = uncertainty
+                        local_embs[idx] = emb
                     
-                    all_alphas[idx, i] = alpha
-                    all_beliefs[idx, i] = belief
-                    all_uncertainties[idx, i] = uncertainty
-                    all_embs[idx, i] = emb
-                
-                if self.verbose:
-                    print(f"    [{b+1}/{B}] {agent.name} done")
+                    if self.verbose:
+                        print(f"    [{b+1}/{B}] {agent.name} done")
+            except Exception as e:
+                print(f"    [ERROR] {agent.name} 推理失败: {e}")
+                # 用中性值填充未处理的样本
+                for idx in range(B):
+                    if local_alphas[idx].sum() == 0:
+                        local_alphas[idx] = torch.ones(self.num_classes)
+                        local_beliefs[idx] = torch.ones(self.num_classes) / self.num_classes
+                        local_uncertainties[idx] = torch.tensor(1.0)
+                        local_embs[idx] = torch.zeros(D)
+            
+            return i, local_alphas, local_beliefs, local_uncertainties, local_embs
+        
+        # ★ 并行运行所有Agent
+        if self.verbose:
+            print(f"  ★ 并行运行 {N} 个Agent (ThreadPoolExecutor)...")
+        
+        with ThreadPoolExecutor(max_workers=N) as executor:
+            futures = {executor.submit(_run_single_agent, (i, agent)): i 
+                      for i, agent in enumerate(self.agents)}
+            for future in as_completed(futures):
+                i, alphas, beliefs, uncertainties, embs = future.result()
+                all_alphas[:, i] = alphas
+                all_beliefs[:, i] = beliefs
+                all_uncertainties[:, i] = uncertainties
+                all_embs[:, i] = embs
         
         # 多数投票
         preds_by_agent = all_beliefs.argmax(dim=-1)  # [B, N]

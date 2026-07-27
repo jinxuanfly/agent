@@ -23,6 +23,7 @@ import pandas as pd
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 import torch.nn as nn
@@ -859,34 +860,65 @@ def run_llm_evaluation(
         else:
             agents_to_run.append((i, agent))
     
-    # 只运行需要重新推理的Agent
-    for i, agent in agents_to_run:
-        print(f"\n  运行 {agent.name}...")
-        for idx in tqdm(range(B_train), desc=f"    Agent{i+1}"):
-            if i == 0:
-                alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image_description=None)
-            elif i == 1:
-                if agent.use_direct_image:
-                    alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image=train_images[idx])
-                else:
-                    alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image_description=train_image_descriptions[idx])
-            else:
-                alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image_description=train_image_descriptions[idx])
-            all_train_alphas[idx, i] = alpha
-            all_train_beliefs[idx, i] = belief
-            all_train_uncertainties[idx, i] = uncertainty
-            all_train_embs[idx, i] = emb
+    # ★ 并行运行需要重新推理的Agent
+    if agents_to_run:
+        print(f"\n  ★ 并行运行 {len(agents_to_run)} 个Agent (ThreadPoolExecutor)...")
         
-        # 每个Agent完成后立即保存独立缓存
-        if save_cache:
-            agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_train_agent{i}.pt')
-            torch.save({
-                'alphas': all_train_alphas[:, i],
-                'beliefs': all_train_beliefs[:, i],
-                'uncertainties': all_train_uncertainties[:, i],
-                'embs': all_train_embs[:, i],
-            }, agent_cache_path)
-            print(f"    {agent.name} 输出已缓存: {agent_cache_path}")
+        def _run_train_agent(i_agent_tuple):
+            """在独立线程中运行一个Agent的全部推理"""
+            i, agent = i_agent_tuple
+            embed_dim = agent.embed_dim
+            local_alphas = torch.zeros(B_train, NUM_CLASSES)
+            local_beliefs = torch.zeros(B_train, NUM_CLASSES)
+            local_uncertainties = torch.zeros(B_train)
+            local_embs = torch.zeros(B_train, embed_dim)
+            
+            try:
+                for idx in range(B_train):
+                    if i == 0:
+                        alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image_description=None)
+                    elif i == 1:
+                        if agent.use_direct_image:
+                            alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image=train_images[idx])
+                        else:
+                            alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image_description=train_image_descriptions[idx])
+                    else:
+                        alpha, belief, uncertainty, emb = agent.forward(train_texts[idx], image_description=train_image_descriptions[idx])
+                    local_alphas[idx] = alpha
+                    local_beliefs[idx] = belief
+                    local_uncertainties[idx] = uncertainty
+                    local_embs[idx] = emb
+            except Exception as e:
+                print(f"    [ERROR] {agent.name} 推理失败: {e}")
+                # 用中性值填充剩余样本
+                for idx in range(B_train):
+                    if local_alphas[idx].sum() == 0:
+                        local_alphas[idx] = torch.ones(NUM_CLASSES)
+                        local_beliefs[idx] = torch.ones(NUM_CLASSES) / NUM_CLASSES
+                        local_uncertainties[idx] = torch.tensor(1.0)
+                        local_embs[idx] = torch.zeros(embed_dim)
+            
+            return i, local_alphas, local_beliefs, local_uncertainties, local_embs
+        
+        with ThreadPoolExecutor(max_workers=len(agents_to_run)) as executor:
+            futures = {executor.submit(_run_train_agent, item): item for item in agents_to_run}
+            for future in as_completed(futures):
+                i, alphas, beliefs, uncertainties, embs = future.result()
+                all_train_alphas[:, i] = alphas
+                all_train_beliefs[:, i] = beliefs
+                all_train_uncertainties[:, i] = uncertainties
+                all_train_embs[:, i] = embs
+                
+                # 每个Agent完成后立即保存独立缓存
+                if save_cache:
+                    agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_train_agent{i}.pt')
+                    torch.save({
+                        'alphas': all_train_alphas[:, i],
+                        'beliefs': all_train_beliefs[:, i],
+                        'uncertainties': all_train_uncertainties[:, i],
+                        'embs': all_train_embs[:, i],
+                    }, agent_cache_path)
+                    print(f"    Agent{i+1} 输出已缓存: {agent_cache_path}")
     
     train_time = time.time() - train_start
     print(f"\n  训练集推理完成 ({train_time:.1f}秒)")
@@ -1133,34 +1165,64 @@ def run_llm_evaluation(
         else:
             val_agents_to_run.append((i, agent))
     
-    # 只运行需要重新推理的Agent
-    for i, agent in val_agents_to_run:
-        print(f"\n  运行 {agent.name}...")
-        for idx in tqdm(range(B_val), desc=f"    Agent{i+1}"):
-            if i == 0:
-                alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image_description=None)
-            elif i == 1:
-                if agent.use_direct_image:
-                    alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image=val_images[idx])
-                else:
-                    alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image_description=val_image_descriptions[idx])
-            else:
-                alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image_description=val_image_descriptions[idx])
-            all_val_alphas[idx, i] = alpha
-            all_val_beliefs[idx, i] = belief
-            all_val_uncertainties[idx, i] = uncertainty
-            all_val_embs[idx, i] = emb
+    # ★ 并行运行需要重新推理的Agent
+    if val_agents_to_run:
+        print(f"\n  ★ 并行运行 {len(val_agents_to_run)} 个Agent (ThreadPoolExecutor)...")
         
-        # 每个Agent完成后立即保存独立缓存
-        if save_cache:
-            agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_val_agent{i}.pt')
-            torch.save({
-                'alphas': all_val_alphas[:, i],
-                'beliefs': all_val_beliefs[:, i],
-                'uncertainties': all_val_uncertainties[:, i],
-                'embs': all_val_embs[:, i],
-            }, agent_cache_path)
-            print(f"    {agent.name} 验证集输出已缓存: {agent_cache_path}")
+        def _run_val_agent(i_agent_tuple):
+            """在独立线程中运行一个Agent的验证集推理"""
+            i, agent = i_agent_tuple
+            embed_dim = agent.embed_dim
+            local_alphas = torch.zeros(B_val, NUM_CLASSES)
+            local_beliefs = torch.zeros(B_val, NUM_CLASSES)
+            local_uncertainties = torch.zeros(B_val)
+            local_embs = torch.zeros(B_val, embed_dim)
+            
+            try:
+                for idx in range(B_val):
+                    if i == 0:
+                        alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image_description=None)
+                    elif i == 1:
+                        if agent.use_direct_image:
+                            alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image=val_images[idx])
+                        else:
+                            alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image_description=val_image_descriptions[idx])
+                    else:
+                        alpha, belief, uncertainty, emb = agent.forward(val_texts[idx], image_description=val_image_descriptions[idx])
+                    local_alphas[idx] = alpha
+                    local_beliefs[idx] = belief
+                    local_uncertainties[idx] = uncertainty
+                    local_embs[idx] = emb
+            except Exception as e:
+                print(f"    [ERROR] {agent.name} 验证集推理失败: {e}")
+                for idx in range(B_val):
+                    if local_alphas[idx].sum() == 0:
+                        local_alphas[idx] = torch.ones(NUM_CLASSES)
+                        local_beliefs[idx] = torch.ones(NUM_CLASSES) / NUM_CLASSES
+                        local_uncertainties[idx] = torch.tensor(1.0)
+                        local_embs[idx] = torch.zeros(embed_dim)
+            
+            return i, local_alphas, local_beliefs, local_uncertainties, local_embs
+        
+        with ThreadPoolExecutor(max_workers=len(val_agents_to_run)) as executor:
+            futures = {executor.submit(_run_val_agent, item): item for item in val_agents_to_run}
+            for future in as_completed(futures):
+                i, alphas, beliefs, uncertainties, embs = future.result()
+                all_val_alphas[:, i] = alphas
+                all_val_beliefs[:, i] = beliefs
+                all_val_uncertainties[:, i] = uncertainties
+                all_val_embs[:, i] = embs
+                
+                # 每个Agent完成后立即保存独立缓存
+                if save_cache:
+                    agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_val_agent{i}.pt')
+                    torch.save({
+                        'alphas': all_val_alphas[:, i],
+                        'beliefs': all_val_beliefs[:, i],
+                        'uncertainties': all_val_uncertainties[:, i],
+                        'embs': all_val_embs[:, i],
+                    }, agent_cache_path)
+                    print(f"    Agent{i+1} 验证集输出已缓存: {agent_cache_path}")
     
     val_time = time.time() - val_start
     print(f"\n  验证集推理完成 ({val_time:.1f}秒)")
