@@ -302,7 +302,7 @@ class LLMClient:
             'success': True,
         }
 
-    def _image_to_base64(self, image, max_size=800, quality=80):
+    def _image_to_base64(self, image, max_size=512, quality=50):
         """将PIL Image转换为base64编码（限制大小避免400错误）"""
         import io
         width, height = image.size
@@ -347,7 +347,7 @@ class LLMClient:
                 self._rate_limiter.wait()
                 
                 if image is not None:
-                    quality = max(40, 80 - attempt * 15)
+                    quality = max(30, 50 - attempt * 10)
                     image_base64 = self._image_to_base64(image, quality=quality)
                     content = [
                         {"type": "text", "text": text},

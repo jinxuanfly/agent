@@ -235,10 +235,9 @@ class LLMAgent:
         self.call_count += 1
         
         if not result.get('success', False):
-            # 失败时返回均匀分布
-            alpha = torch.ones(self.num_classes)
+            alpha = torch.ones(self.num_classes) * 1.5
             belief = torch.ones(self.num_classes) / self.num_classes
-            uncertainty = torch.tensor(1.0)
+            uncertainty = torch.tensor(0.6)
             embedding = torch.zeros(self.embed_dim)
             return alpha, belief, uncertainty, embedding
         
