@@ -314,7 +314,7 @@ def llm_reflection_loop(agents, texts, image_descriptions, images,
 
 def main(max_val=200, providers=None):
     if providers is None:
-        providers = ['deepseek', 'gpt', 'gpt']
+        providers = ['gpt5', 'gemini', 'gpt5']
     print("=" * 70)
     print("Step5: LLM因果反事实反思（优化版）")
     print("=" * 70)
@@ -389,8 +389,8 @@ def main(max_val=200, providers=None):
             system_prompt=AGENT_PROMPTS.get(['text_focused', 'image_focused', 'multimodal_fusion'][i]),
             embed_dim=256,
             num_classes=NUM_CLASSES,
-            use_image=(i >= 2),
-            use_direct_image=(i == 1 and provider == 'glm'),
+            use_image=(i >= 1),
+            use_direct_image=(i >= 1 and provider in ['glm', 'gpt', 'gpt5', 'gpt4om', 'gemini']),
             verbose=False,
         )
         agents.append(agent)
@@ -470,7 +470,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_val', type=int, default=200)
     parser.add_argument('--provider1', type=str, default='deepseek')
-    parser.add_argument('--provider2', type=str, default='gpt')
-    parser.add_argument('--provider3', type=str, default='gpt')
+    parser.add_argument('--provider2', type=str, default='gemini')
+    parser.add_argument('--provider3', type=str, default='gpt5')
     args = parser.parse_args()
     main(max_val=args.max_val, providers=[args.provider1, args.provider2, args.provider3])

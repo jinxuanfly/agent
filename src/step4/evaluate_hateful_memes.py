@@ -1,10 +1,10 @@
 """
 第四步：Hateful Memes 多模态评估（v1）
 =========================================
-设计思路（与 CIFAR-10N 版本的关键区别）：
+设计思路：
 - 真正的多模态：文本（BERT）+ 图像（ResNet）+ 弱融合（坏模态模拟）
 - 三个异构智能体自然地产生分歧——这正是我们框架的目标场景
-- 评估指标同 CIFAR-10N：Acc、F1、ECE、拒识率
+- 评估指标：Acc、F1、ECE、拒识率
 
 智能体设计：
   Agent1 (TextBERT)  : BERT 文本编码 → EvidenceHead
@@ -468,7 +468,7 @@ def train_evidence_head(train_feats, train_labels, val_feats, val_labels,
 
 
 # =============================================================================
-# 5. DS融合（与CIFAR-10N版本一致）
+# 5. DS融合
 # =============================================================================
 
 def ds_fusion_decision(all_beliefs, all_uncertainties, u_threshold=0.5):

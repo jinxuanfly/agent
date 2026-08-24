@@ -301,6 +301,216 @@ def ds_fusion_decision(all_beliefs, all_uncertainties, u_threshold=0.5, agent_we
     return preds, rejected, global_u
 
 
+def compute_agent_correlation(train_beliefs, train_labels):
+    """计算Agent间相关性矩阵
+    
+    基于Agent预测的一致性估计相关性：
+    - 两个Agent在相同样本上预测一致的比例
+    - 减去随机一致的概率（基线）
+    
+    Returns:
+        corr_matrix: [N, N] 相关性矩阵，值域[0, 1]
+    """
+    N = len(train_beliefs)
+    device = train_beliefs[0].device
+    
+    # 计算每个Agent的预测
+    preds = []
+    for i in range(N):
+        preds.append(train_beliefs[i].argmax(dim=1))
+    
+    # 计算每个Agent的准确率（用于估计随机一致概率）
+    accs = []
+    for i in range(N):
+        acc = (preds[i] == train_labels).float().mean().item()
+        accs.append(max(acc, 0.01))
+    
+    # 计算两两Agent的一致性
+    corr_matrix = torch.zeros(N, N, device=device)
+    for i in range(N):
+        for j in range(N):
+            if i == j:
+                corr_matrix[i, j] = 1.0
+            else:
+                # 实际一致率
+                agreement = (preds[i] == preds[j]).float().mean().item()
+                # 随机一致概率（假设独立）
+                # P(agree|independent) = p_i * p_j + (1-p_i) * (1-p_j)
+                # 其中 p_i 是Agent i预测为1的比例
+                p_i = preds[i].float().mean().item()
+                p_j = preds[j].float().mean().item()
+                random_agree = p_i * p_j + (1 - p_i) * (1 - p_j)
+                # 相关性 = (实际一致 - 随机一致) / (1 - 随机一致)
+                denom = 1 - random_agree
+                if denom > 1e-6:
+                    corr = (agreement - random_agree) / denom
+                else:
+                    corr = 0.0
+                corr_matrix[i, j] = max(0.0, min(1.0, corr))
+    
+    return corr_matrix
+
+
+def correlation_aware_ds_fusion(all_beliefs, all_uncertainties, u_threshold=0.5, 
+                                agent_weights=None, correlation_matrix=None,
+                                discount_strength=0.5):
+    """相关性感知的DS融合
+    
+    对相关Agent的证据进行折扣，避免过度自信。
+    当两个Agent高度相关时（如同源模型），折扣其证据贡献。
+    
+    Args:
+        all_beliefs: list of [B, C] tensors
+        all_uncertainties: list of [B] tensors
+        u_threshold: 拒绝阈值
+        agent_weights: Agent权重
+        correlation_matrix: [N, N] Agent间相关性矩阵
+        discount_strength: 折扣强度（0=无折扣, 1=完全折扣相关Agent）
+    
+    Returns:
+        preds, rejected, global_u
+    """
+    B = all_beliefs[0].shape[0]
+    C = all_beliefs[0].shape[1]
+    N = len(all_beliefs)
+    device = all_beliefs[0].device
+
+    if agent_weights is None:
+        agent_weights = torch.ones(N, device=device) / N
+
+    if correlation_matrix is None:
+        correlation_matrix = torch.zeros(N, N, device=device)
+
+    # 计算每个Agent的有效独立性折扣因子
+    # Agent k的折扣 = 1 - discount_strength * max_{j<k} correlation[k, j]
+    # 即：如果Agent k与之前已融合的某个Agent高度相关，则折扣其证据
+    discounts = torch.ones(N, device=device)
+    for k in range(1, N):
+        if k > 0:
+            max_corr = correlation_matrix[k, :k].max()
+            discounts[k] = 1.0 - discount_strength * max_corr.item()
+            discounts[k] = max(0.1, discounts[k])  # 至少保留10%证据
+
+    # 使用折扣调整agent_weights
+    adjusted_weights = agent_weights * discounts
+    adjusted_weights = adjusted_weights / (adjusted_weights.sum() + 1e-8)
+
+    # 执行DS融合（与标准DS相同，但使用调整后的权重）
+    b0 = all_beliefs[0]
+    u0 = all_uncertainties[0]
+    w0 = adjusted_weights[0]
+    
+    combined_belief = b0 * (1.0 - u0.unsqueeze(-1)) * w0
+    combined_u = u0 * w0 + (1 - w0) * 0.5
+
+    for b_idx in range(1, N):
+        b = all_beliefs[b_idx]
+        u = all_uncertainties[b_idx]
+        w = adjusted_weights[b_idx]
+
+        m1_b = combined_belief
+        m1_u = combined_u
+        m2_b = b * (1.0 - u.unsqueeze(-1)) * w
+        m2_u = u * w + (1 - w) * 0.5
+
+        sum_m1_b = m1_b.sum(dim=-1)
+        sum_m2_b = m2_b.sum(dim=-1)
+        agree = (m1_b * m2_b).sum(dim=-1)
+        K = sum_m1_b * sum_m2_b - agree
+
+        denom = 1.0 - K + 1e-8
+        new_belief = (m1_b * m2_b + m1_b * m2_u.unsqueeze(-1) + m1_u.unsqueeze(-1) * m2_b) / denom.unsqueeze(-1)
+        new_u = m1_u * m2_u / denom
+        combined_belief = new_belief
+        combined_u = new_u
+
+    global_belief = combined_belief / (1.0 - combined_u.unsqueeze(-1) + 1e-8)
+    global_u = combined_u
+    preds = global_belief.argmax(dim=-1)
+    rejected = global_u > u_threshold
+    return preds, rejected, global_u
+
+
+def uncertainty_weighted_ds_fusion(all_beliefs, all_uncertainties, u_threshold=0.5,
+                                     correlation_matrix=None, discount_strength=0.0,
+                                     sharpness=20.0):
+    """基于不确定性的自适应权重DS融合
+
+    创新点：用Agent的不确定性u作为能力指标，而非训练集准确率
+    - u越低 → Agent越自信 → 能力越强 → 权重越高
+    - 每个样本独立计算权重，更精细
+    - 避免训练集准确率过拟合问题（如Gemini训练49.5%但验证79.6%）
+
+    Args:
+        all_beliefs: list of [B, C] tensors
+        all_uncertainties: list of [B] tensors
+        u_threshold: 拒绝阈值
+        correlation_matrix: 相关性矩阵（可选，用于相关性折扣）
+        discount_strength: 相关性折扣强度
+        sharpness: 权重差距放大系数，越大强Agent权重越高
+
+    Returns:
+        preds, rejected, global_u
+    """
+    B = all_beliefs[0].shape[0]
+    C = all_beliefs[0].shape[1]
+    N = len(all_beliefs)
+    device = all_beliefs[0].device
+
+    # 每个样本下每个Agent的权重：softmax((1 - u_i) * sharpness)
+    u_stack = torch.stack(all_uncertainties, dim=1)  # [B, N]
+    confidence = 1.0 - u_stack  # [B, N]
+    scaled_conf = confidence * sharpness
+    scaled_conf = scaled_conf - scaled_conf.max(dim=1, keepdim=True)[0]
+    exp_conf = torch.exp(scaled_conf)
+    sample_weights = exp_conf / (exp_conf.sum(dim=1, keepdim=True) + 1e-8)  # [B, N]
+
+    # 相关性折扣（可选）
+    if correlation_matrix is not None and discount_strength > 0:
+        discounts = torch.ones(N, device=device)
+        for k in range(1, N):
+            max_corr = correlation_matrix[k, :k].max()
+            discounts[k] = 1.0 - discount_strength * max_corr.item()
+            discounts[k] = max(0.1, discounts[k])
+        sample_weights = sample_weights * discounts.unsqueeze(0)
+        sample_weights = sample_weights / (sample_weights.sum(dim=1, keepdim=True) + 1e-8)
+
+    # 执行DS融合（每个样本使用对应权重）
+    b0 = all_beliefs[0]
+    u0 = all_uncertainties[0]
+    w0 = sample_weights[:, 0]  # [B]
+
+    combined_belief = b0 * (1.0 - u0.unsqueeze(-1)) * w0.unsqueeze(-1)
+    combined_u = u0 * w0 + (1 - w0) * 0.5
+
+    for b_idx in range(1, N):
+        b = all_beliefs[b_idx]
+        u = all_uncertainties[b_idx]
+        w = sample_weights[:, b_idx]  # [B]
+
+        m1_b = combined_belief
+        m1_u = combined_u
+        m2_b = b * (1.0 - u.unsqueeze(-1)) * w.unsqueeze(-1)
+        m2_u = u * w + (1 - w) * 0.5
+
+        sum_m1_b = m1_b.sum(dim=-1)
+        sum_m2_b = m2_b.sum(dim=-1)
+        agree = (m1_b * m2_b).sum(dim=-1)
+        K = sum_m1_b * sum_m2_b - agree
+
+        denom = 1.0 - K + 1e-8
+        new_belief = (m1_b * m2_b + m1_b * m2_u.unsqueeze(-1) + m1_u.unsqueeze(-1) * m2_b) / denom.unsqueeze(-1)
+        new_u = m1_u * m2_u / denom
+        combined_belief = new_belief
+        combined_u = new_u
+
+    global_belief = combined_belief / (1.0 - combined_u.unsqueeze(-1) + 1e-8)
+    global_u = combined_u
+    preds = global_belief.argmax(dim=-1)
+    rejected = global_u > u_threshold
+    return preds, rejected, global_u
+
+
 def generate_emnet_data_supervised(train_alphas, train_labels, n_synthetic=3000, num_classes=2, device='cpu'):
     """生成EMNet训练数据（与原始管线相同）"""
     N = train_alphas.shape[0]
@@ -646,11 +856,98 @@ class ImageEncoder:
         
         return "图像内容：" + ", ".join(desc_parts)
     
-    def encode_batch(self, images):
-        """批量编码图像"""
-        descriptions = []
-        for img in images:
-            descriptions.append(self.encode_image(img))
+    def encode_batch(self, images, batch_desc="", progress_interval=50):
+        """批量编码图像（带进度打印 + 批量CLIP推理加速）
+
+        Args:
+            images: PIL Image列表
+            batch_desc: 批次描述文字（如"训练集"）用于进度打印
+            progress_interval: 每多少张打印一次进度
+        """
+        import sys
+        import torch
+        N = len(images)
+        descriptions = [""] * N  # 预先分配，避免顺序错乱
+
+        if self.use_clip and self.clip_model is not None:
+            # ===== 批量CLIP推理（5-10倍加速） =====
+            import clip
+            BATCH_SIZE = 16  # 一次编码16张图像
+            candidate_descriptions = [
+                "group of people", "single person", "cartoon character",
+                "text only", "image with text", "political meme",
+                "protest image", "celebrity photo", "animal picture",
+                "nature landscape", "sports image", "food picture",
+                "meme format", "satire", "irony", "propaganda",
+                "historical figure", "religious symbol", "national flag",
+                "police image", "military", "firearm", "weapon",
+                "graffiti", "artwork", "illustration", "photograph",
+                "screenshot", "news clip", "advertisement", "poster",
+                "smiling face", "angry expression", "sad person",
+                "happy crowd", "protesting people", "marching group",
+                "holding sign", "raising fist", "waving flag",
+                "celebration", "riot", "peaceful gathering",
+                "building exterior", "interior room", "street scene",
+                "park", "beach", "mountain", "forest",
+                "city skyline", "countryside", "desert", "ocean",
+                "sunny day", "night scene", "rainy weather", "snowy",
+                "colorful image", "black and white", "dark mood", "bright",
+                "portrait", "landscape", "close up", "wide shot",
+                "famous landmark", "unknown location", "urban setting", "rural",
+                "text overlay", "caption", "title", "subtitle",
+                "symbolic image", "abstract art", "realistic photo", "sketch"
+            ]
+
+            # 先批量编码所有文本特征（一次即可）
+            text_inputs = clip.tokenize(candidate_descriptions).to(self.device)
+            with torch.no_grad():
+                text_features = self.clip_model.encode_text(text_inputs)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+            # 分batch编码图像
+            for start in range(0, N, BATCH_SIZE):
+                end = min(start + BATCH_SIZE, N)
+                batch_imgs = []
+                batch_indices = []
+                for idx in range(start, end):
+                    img = images[idx]
+                    if img is None:
+                        descriptions[idx] = "无法识别图像"
+                    else:
+                        batch_imgs.append(self.clip_preprocess(img))
+                        batch_indices.append(idx)
+
+                if batch_imgs:
+                    img_tensor = torch.stack(batch_imgs).to(self.device)
+                    with torch.no_grad():
+                        image_features = self.clip_model.encode_image(img_tensor)
+                        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                        # [B, 512] x [512, 76] -> [B, 76]
+                        similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+
+                    for b_i, idx in enumerate(batch_indices):
+                        top5_vals, top5_indices = similarity[b_i].topk(5)
+                        top5_labels = [candidate_descriptions[i] for i in top5_indices.cpu().numpy()]
+                        top5_scores = top5_vals.cpu().numpy().tolist()
+                        desc_parts = []
+                        for label, score in zip(top5_labels, top5_scores):
+                            if score > 0.02:
+                                desc_parts.append(f"{label}:{score:.2f}")
+                        descriptions[idx] = "图像内容[" + ", ".join(desc_parts) + "]"
+
+                # 进度打印 + flush
+                if (end % progress_interval == 0) or end == N:
+                    sys.stdout.write(f"  [{batch_desc}] 图像描述进度: {end}/{N} ({100*end/N:.0f}%)\n")
+                    sys.stdout.flush()
+
+        else:
+            # 无CLIP的mock模式，带进度
+            for i, img in enumerate(images):
+                descriptions[i] = self.encode_image(img)
+                if ((i + 1) % progress_interval == 0) or (i + 1 == N):
+                    sys.stdout.write(f"  [{batch_desc}] 图像描述进度: {i+1}/{N} ({100*(i+1)/N:.0f}%)\n")
+                    sys.stdout.flush()
+
         return descriptions
 
 
@@ -662,8 +959,9 @@ def run_llm_evaluation(
     max_train=200,
     max_val=200,
     provider1='deepseek',
-    provider2='glm',
-    provider3='gpt',
+    provider2='gemini',
+    provider3='gpt5',
+    seed=42,
     train_gat=True,
     enable_emnet=True,
     batch_size=8,
@@ -686,12 +984,22 @@ def run_llm_evaluation(
         provider1: Agent1的模型提供者
         provider2: Agent2的模型提供者
         provider3: Agent3的模型提供者
+        seed: 随机种子（用于多种子实验）
         train_gat: 是否训练GAT共识层
         enable_emnet: 是否启用EMNet纠偏
         batch_size: LLM API并发批次大小
         save_cache: 是否保存LLM输出缓存
         skip_llm_inference: 是否跳过LLM推理（直接使用缓存）
     """
+    # 设置随机种子
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    # 缓存目录：按seed隔离
+    seed_suffix = f'_seed{seed}'
+    
     print("=" * 70)
     print("LLM增强的 Hateful Memes 评估管线（异构多模态）")
     print("=" * 70)
@@ -700,6 +1008,7 @@ def run_llm_evaluation(
     print(f"  Agent2: {provider2} (仅图像)")
     print(f"  Agent3: {provider3} (文本+图像)")
     print(f"  Train/Val: {max_train}/{max_val}")
+    print(f"  Seed: {seed}")
     print(f"  GAT: {'启用' if train_gat else '禁用'}")
     print(f"  EMNet: {'启用' if enable_emnet else '禁用'}")
     print(f"  跳过LLM推理: {'是' if skip_llm_inference else '否'}")
@@ -742,20 +1051,54 @@ def run_llm_evaluation(
     check_label_distribution(val_labels, "验证集")
 
     if not skip_llm_inference:
-        # ========== 1.5 图像编码（生成图像描述） ==========
+        # ========== 1.5 图像编码（生成图像描述，带缓存） ==========
         print("\n[1.5] 初始化图像编码器...")
         train_dataset_with_images = HatefulMemesDataset(split='train', max_samples=max_train, load_images=True)
         val_dataset_with_images = HatefulMemesDataset(split='dev', max_samples=max_val, load_images=True)
         train_images = train_dataset_with_images.images
         val_images = val_dataset_with_images.images
-        
+
         image_encoder = ImageEncoder(use_clip=True, device=DEVICE)
-        
-        print("  生成训练集图像描述...")
-        train_image_descriptions = image_encoder.encode_batch(train_images)
-        
-        print("  生成验证集图像描述...")
-        val_image_descriptions = image_encoder.encode_batch(val_images)
+
+        # 图像描述缓存路径
+        train_desc_cache = os.path.join(CHECKPOINT_DIR, f'img_desc_train_{max_train}.pkl')
+        val_desc_cache = os.path.join(CHECKPOINT_DIR, f'img_desc_val_{max_val}.pkl')
+
+        # 加载或生成训练集图像描述
+        if os.path.exists(train_desc_cache):
+            print(f"  加载训练集图像描述缓存: {train_desc_cache}")
+            with open(train_desc_cache, 'rb') as f:
+                import pickle
+                train_image_descriptions = pickle.load(f)
+            print(f"  已加载 {len(train_image_descriptions)} 条训练集图像描述")
+        else:
+            import sys as _sys
+            _sys.stdout.flush()
+            print("  生成训练集图像描述...")
+            _sys.stdout.flush()
+            train_image_descriptions = image_encoder.encode_batch(train_images, batch_desc="train", progress_interval=50)
+            with open(train_desc_cache, 'wb') as f:
+                import pickle
+                pickle.dump(train_image_descriptions, f)
+            print(f"  已缓存训练集图像描述到 {train_desc_cache}")
+
+        # 加载或生成验证集图像描述
+        if os.path.exists(val_desc_cache):
+            print(f"  加载验证集图像描述缓存: {val_desc_cache}")
+            with open(val_desc_cache, 'rb') as f:
+                import pickle
+                val_image_descriptions = pickle.load(f)
+            print(f"  已加载 {len(val_image_descriptions)} 条验证集图像描述")
+        else:
+            import sys as _sys2
+            _sys2.stdout.flush()
+            print("  生成验证集图像描述...")
+            _sys2.stdout.flush()
+            val_image_descriptions = image_encoder.encode_batch(val_images, batch_desc="val", progress_interval=50)
+            with open(val_desc_cache, 'wb') as f:
+                import pickle
+                pickle.dump(val_image_descriptions, f)
+            print(f"  已缓存验证集图像描述到 {val_desc_cache}")
 
         # ========== 2. 创建LLM Agent（异构多模态） ==========
         print("\n[2] 创建LLM Agent...")
@@ -774,7 +1117,7 @@ def run_llm_evaluation(
                 timeout=180,
                 min_call_interval=0.0,
             )
-            use_direct_image = (i >= 1 and prov in ['glm', 'gpt', 'gemini'])
+            use_direct_image = (i >= 1 and prov in ['glm', 'gpt', 'gpt5', 'gpt4om', 'gemini'])
             use_image_for_agent = (i >= 1)
             agent = LLMAgent(
                 client=client,
@@ -795,6 +1138,24 @@ def run_llm_evaluation(
     print(f"\n[3] 训练集LLM推理 ({B_train}样本)...")
     if skip_llm_inference:
         print(f"  ★ 跳过LLM推理，直接使用缓存")
+        # 仍需创建agents实例（用于后续可能的引用，如agent.name）
+        providers = [provider1, provider2, provider3]
+        agent_names = ["Agent1(文本专家)", "Agent2(图像专家)", "Agent3(跨模态)"]
+        agent_prompts = ["text_focused", "image_focused", "multimodal_fusion"]
+        agents = []
+        for i, (prov, name, prompt_key) in enumerate(zip(providers, agent_names, agent_prompts)):
+            client = LLMClient(
+                provider=prov, temperature=0.1, max_retries=2, timeout=60, min_call_interval=0.0,
+            )
+            use_direct_image = (i >= 1 and prov in ['glm', 'gpt', 'gpt5', 'gpt4om', 'gemini'])
+            use_image_for_agent = (i >= 1)
+            agent = LLMAgent(
+                client=client, name=name, system_prompt=AGENT_PROMPTS.get(prompt_key),
+                embed_dim=256, num_classes=NUM_CLASSES,
+                use_image=use_image_for_agent, use_direct_image=use_direct_image, verbose=False,
+            )
+            agents.append(agent)
+        print(f"  已创建 {len(agents)} 个Agent实例（仅用于元数据）")
     else:
         print(f"  第一次Agent调用可能较慢（API预热）...")
         print(f"  ★ 如果提示未设置API key，将使用模拟模式")
@@ -811,7 +1172,7 @@ def run_llm_evaluation(
         print(f"  检测到旧格式缓存，正在转换为独立Agent缓存...")
         cached_train = torch.load(old_cache_path, map_location='cpu')
         for i in range(3):
-            agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_train_agent{i}.pt')
+            agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_train_agent{i}{seed_suffix}.pt')
             torch.save({
                 'alphas': cached_train['alphas'][:, i],
                 'beliefs': cached_train['beliefs'][:, i],
@@ -826,7 +1187,7 @@ def run_llm_evaluation(
     agents_to_run = []
     
     for i, agent in enumerate(agents):
-        agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_train_agent{i}.pt')
+        agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_train_agent{i}{seed_suffix}.pt')
         force_rerun = force_rerun_agent is not None and i == force_rerun_agent
         skip_current = skip_agent is not None and i == skip_agent
         
@@ -911,7 +1272,7 @@ def run_llm_evaluation(
                 
                 # 每个Agent完成后立即保存独立缓存
                 if save_cache:
-                    agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_train_agent{i}.pt')
+                    agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_train_agent{i}{seed_suffix}.pt')
                     torch.save({
                         'alphas': all_train_alphas[:, i],
                         'beliefs': all_train_beliefs[:, i],
@@ -960,9 +1321,16 @@ def run_llm_evaluation(
     
     train_acc_weights = torch.tensor(train_agent_accs, device=DEVICE)
     train_acc_weights = F.softmax(train_acc_weights, dim=0)
-    
+
     print(f"  训练集Agent准确率: Agent1={train_agent_accs[0]:.4f}, Agent2={train_agent_accs[1]:.4f}, Agent3={train_agent_accs[2]:.4f}")
     print(f"  训练集Agent权重: {train_acc_weights.cpu().numpy()}")
+
+    # 计算Agent间相关性矩阵（用于Correlation-Aware DS融合）
+    agent_corr_matrix = compute_agent_correlation(train_all_beliefs, train_y)
+    print(f"  Agent相关性矩阵:")
+    for i in range(3):
+        row = "    " + "  ".join(f"{agent_corr_matrix[i,j].item():.3f}" for j in range(3))
+        print(row)
     
     # DS融合基线（使用训练集权重）
     train_ds_preds, _, _ = ds_fusion_decision(train_all_beliefs, train_all_us, u_threshold=U_THRESHOLD, agent_weights=train_acc_weights)
@@ -990,7 +1358,7 @@ def run_llm_evaluation(
             node_dim=gat_node_dim, hidden_dim=64, embed_dim=256, num_classes=NUM_CLASSES
         ).to(DEVICE)
         
-        gat_model_path = os.path.join(CHECKPOINT_DIR, 'gat_consensus_llm.pt')
+        gat_model_path = os.path.join(CHECKPOINT_DIR, f'gat_consensus_llm{seed_suffix}.pt')
         if os.path.exists(gat_model_path):
             gat_layer.load_state_dict(torch.load(gat_model_path, map_location=DEVICE, weights_only=True))
             gat_layer.eval()
@@ -1116,7 +1484,7 @@ def run_llm_evaluation(
         print(f"  检测到旧格式验证集缓存，正在转换为独立Agent缓存...")
         cached_val = torch.load(old_cache_path_val, map_location='cpu')
         for i in range(3):
-            agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_val_agent{i}.pt')
+            agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_val_agent{i}{seed_suffix}.pt')
             torch.save({
                 'alphas': cached_val['alphas'][:, i],
                 'beliefs': cached_val['beliefs'][:, i],
@@ -1131,7 +1499,7 @@ def run_llm_evaluation(
     val_agents_to_run = []
     
     for i, agent in enumerate(agents):
-        agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_val_agent{i}.pt')
+        agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_val_agent{i}{seed_suffix}.pt')
         force_rerun = force_rerun_agent is not None and i == force_rerun_agent
         skip_current = skip_agent is not None and i == skip_agent
         
@@ -1215,7 +1583,7 @@ def run_llm_evaluation(
                 
                 # 每个Agent完成后立即保存独立缓存
                 if save_cache:
-                    agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_val_agent{i}.pt')
+                    agent_cache_path = os.path.join(CHECKPOINT_DIR, f'llm_val_agent{i}{seed_suffix}.pt')
                     torch.save({
                         'alphas': all_val_alphas[:, i],
                         'beliefs': all_val_beliefs[:, i],
@@ -1275,8 +1643,35 @@ def run_llm_evaluation(
     # === 方法3: DS融合 ===
     b_list = [b1, b2, b3]
     u_list = [u1, u2, u3]
-    
+
     ds_preds, ds_rej, ds_u = ds_fusion_decision(b_list, u_list, u_threshold=U_THRESHOLD, agent_weights=train_acc_weights)
+
+    # === 方法3b: Correlation-Aware DS融合 ===
+    # 基于训练集Agent预测计算相关性矩阵，对相关Agent证据进行折扣
+    corr_ds_preds, corr_ds_rej, corr_ds_u = correlation_aware_ds_fusion(
+        b_list, u_list, u_threshold=U_THRESHOLD,
+        agent_weights=train_acc_weights,
+        correlation_matrix=agent_corr_matrix,
+        discount_strength=0.5,
+    )
+
+    # === 方法3c: Uncertainty-Weighted DS融合（核心创新） ===
+    # 用Agent的u作为能力指标，u越低→能力越强→权重越高
+    # 每个样本独立计算权重，避免训练集准确率过拟合
+    unc_ds_preds, unc_ds_rej, unc_ds_u = uncertainty_weighted_ds_fusion(
+        b_list, u_list, u_threshold=U_THRESHOLD,
+        correlation_matrix=None,  # 调优结果显示相关性折扣无提升
+        discount_strength=0.0,
+        sharpness=20.0,  # 调优最佳值
+    )
+
+    # === 方法3d: Uncertainty-Weighted DS + 相关性折扣 ===
+    unc_corr_ds_preds, unc_corr_ds_rej, unc_corr_ds_u = uncertainty_weighted_ds_fusion(
+        b_list, u_list, u_threshold=U_THRESHOLD,
+        correlation_matrix=agent_corr_matrix,
+        discount_strength=0.3,
+        sharpness=10.0,
+    )
 
     # === 方法4: GAT共识 + DS ===
     if gat_engine is not None:
@@ -1377,7 +1772,7 @@ def run_llm_evaluation(
 
     corr_b_list = [corrected_beliefs[:, i].to(DEVICE) for i in range(3)]
     corr_u_list = [corrected_uncertainties[:, i].to(DEVICE) for i in range(3)]
-    corr_ds_preds, corr_ds_rej, corr_ds_u = ds_fusion_decision(corr_b_list, corr_u_list, u_threshold=U_THRESHOLD)
+    evidswap_preds, evidswap_rej, evidswap_u = ds_fusion_decision(corr_b_list, corr_u_list, u_threshold=U_THRESHOLD)
 
     # === 方法6: 混合策略 - 一致样本直接使用，分歧样本使用GAT ===
     hybrid_preds = torch.zeros(B_val, dtype=torch.long)
@@ -1386,6 +1781,13 @@ def run_llm_evaluation(
             hybrid_preds[b_idx] = mv_preds[b_idx].item()
         else:
             hybrid_preds[b_idx] = gat_fused_preds[b_idx].item()
+
+    # === Oracle: BestAgent (取验证集上最强的单Agent) ===
+    agent_preds_list = [b1.argmax(dim=1), b2.argmax(dim=1), b3.argmax(dim=1)]
+    agent_accs = [(p == torch.tensor(y_true)).float().mean().item() for p in agent_preds_list]
+    best_agent_idx = int(np.argmax(agent_accs))
+    best_agent_preds = agent_preds_list[best_agent_idx]
+    print(f"\n  [BestAgent] 最强单Agent: Agent{best_agent_idx+1} (Acc={agent_accs[best_agent_idx]*100:.2f}%)")
 
     # ========== 汇总结果 ==========
     results = {
@@ -1407,6 +1809,15 @@ def run_llm_evaluation(
         'DS_Fusion': {
             'preds': ds_preds, 'rejected': ds_rej, 'uncertainty': ds_u,
         },
+        'Corr_Aware_DS': {
+            'preds': corr_ds_preds.cpu(), 'rejected': corr_ds_rej.cpu(), 'uncertainty': corr_ds_u.cpu(),
+        },
+        'Uncertainty_Weighted_DS': {
+            'preds': unc_ds_preds.cpu(), 'rejected': unc_ds_rej.cpu(), 'uncertainty': unc_ds_u.cpu(),
+        },
+        'UncWeight_Corr_DS': {
+            'preds': unc_corr_ds_preds.cpu(), 'rejected': unc_corr_ds_rej.cpu(), 'uncertainty': unc_corr_ds_u.cpu(),
+        },
         'GAT_DS_Fusion': {
             'preds': gat_ds_preds, 'rejected': gat_ds_rej, 'uncertainty': gat_ds_u,
         },
@@ -1414,13 +1825,13 @@ def run_llm_evaluation(
             'preds': gat_fused_preds, 'rejected': torch.zeros(B_val, dtype=torch.bool),
         },
         'GAT_EvidenceSwap': {
-            'preds': corr_ds_preds.cpu(), 'rejected': corr_ds_rej.cpu(), 'uncertainty': corr_ds_u.cpu(),
+            'preds': evidswap_preds.cpu(), 'rejected': evidswap_rej.cpu(), 'uncertainty': evidswap_u.cpu(),
         },
         'Hybrid_GAT': {
             'preds': hybrid_preds, 'rejected': torch.zeros(B_val, dtype=torch.bool),
         },
         'BestAgent': {
-            'preds': b3.argmax(dim=1), 'rejected': torch.zeros(B_val, dtype=torch.bool),
+            'preds': best_agent_preds, 'rejected': torch.zeros(B_val, dtype=torch.bool),
         },
     }
 
@@ -1498,7 +1909,7 @@ def run_llm_evaluation(
             print(f"  {method_name:<24s} {acc_disagree:<12.2f} {acc_evidence:<14.2f}")
 
     # ========== 保存结果 ==========
-    result_name = f'llm_{provider1}_{provider2}_{provider3}'
+    result_name = f'llm_{provider1}_{provider2}_{provider3}_seed{seed}'
     result_path = os.path.join(RESULT_DIR, f'evaluation_{result_name}.json')
     with open(result_path, 'w', encoding='utf-8') as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
@@ -1618,13 +2029,15 @@ if __name__ == '__main__':
                         help='验证样本数（推荐100-500）')
     parser.add_argument('--provider1', type=str, default='deepseek',
                         choices=list(PROVIDER_CONFIGS.keys()) + ['mock'],
-                        help='Agent1模型提供者')
-    parser.add_argument('--provider2', type=str, default='glm',
+                        help='Agent1模型提供者（文本专家）')
+    parser.add_argument('--provider2', type=str, default='gemini',
                         choices=list(PROVIDER_CONFIGS.keys()) + ['mock'],
-                        help='Agent2模型提供者')
-    parser.add_argument('--provider3', type=str, default='gpt',
+                        help='Agent2模型提供者（图像专家）')
+    parser.add_argument('--provider3', type=str, default='gpt5',
                         choices=list(PROVIDER_CONFIGS.keys()) + ['mock'],
-                        help='Agent3模型提供者')
+                        help='Agent3模型提供者（跨模态专家）')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='随机种子（用于多种子实验）')
     parser.add_argument('--no_gat', action='store_true', help='禁用GAT训练')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='LLM请求批次大小')
@@ -1639,6 +2052,8 @@ if __name__ == '__main__':
     parser.add_argument('--skip_agent', type=int, default=None,
                         choices=[0, 1, 2],
                         help='跳过指定Agent，用中性占位数据填充（0=Agent1, 1=Agent2, 2=Agent3）')
+    parser.add_argument('--skip_llm_inference', action='store_true',
+                        help='跳过LLM推理，直接使用缓存数据（用于调优融合方法）')
 
     args = parser.parse_args()
 
@@ -1670,9 +2085,11 @@ if __name__ == '__main__':
             provider1=args.provider1,
             provider2=args.provider2,
             provider3=args.provider3,
+            seed=args.seed,
             train_gat=not args.no_gat,
             batch_size=args.batch_size,
             save_cache=not args.no_cache,
             force_rerun_agent=args.force_rerun_agent,
             skip_agent=args.skip_agent,
+            skip_llm_inference=args.skip_llm_inference,
         )

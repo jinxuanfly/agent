@@ -91,6 +91,9 @@ class GATConsensusLayer(nn.Module):
         # 样本权重学习层
         self.sample_weight_net = nn.Linear(3, 1, bias=True)
         
+        # Symbolic GAT: 信念相似度温度参数（可学习）
+        self.sim_temp = nn.Parameter(torch.tensor(1.0))
+        
         self._init_weights()
     
     def _init_weights(self):
@@ -120,6 +123,18 @@ class GATConsensusLayer(nn.Module):
 
         u_factor = (1.0 - u).unsqueeze(0).expand(n, -1)
         e = e * u_factor
+
+        # Symbolic GAT改进：添加信念相似度因子
+        # 提取belief部分，计算Agent间信念余弦相似度
+        belief_start = self.embed_dim
+        belief_end = self.embed_dim + self.num_classes
+        b_i = h[:, belief_start:belief_end]  # [n, C]
+        b_norm = F.normalize(b_i, p=2, dim=1, eps=1e-8)  # [n, C]
+        sim_matrix = b_norm @ b_norm.T  # [n, n] 余弦相似度 [-1, 1]
+        sim_factor = (sim_matrix + 1.0) / 2.0  # 映射到 [0, 1]
+        # 用可学习温度参数调节相似度的影响
+        sim_factor = sim_factor ** self.sim_temp  # sim_temp > 1 时增强差异
+        e = e * sim_factor
 
         mask = torch.eye(n, device=h.device).bool()
         e = e.masked_fill(mask, -1e9)
@@ -173,6 +188,16 @@ class GATConsensusLayer(nn.Module):
 
         u_factor = (1.0 - u).unsqueeze(0).expand(n, -1)
         e = e * u_factor
+
+        # Symbolic GAT: 信念相似度因子
+        belief_start = self.embed_dim
+        belief_end = self.embed_dim + self.num_classes
+        b_i = h[:, belief_start:belief_end]
+        b_norm = F.normalize(b_i, p=2, dim=1, eps=1e-8)
+        sim_matrix = b_norm @ b_norm.T
+        sim_factor = (sim_matrix + 1.0) / 2.0
+        sim_factor = sim_factor ** self.sim_temp
+        e = e * sim_factor
 
         mask = torch.eye(n, device=h.device).bool()
         e = e.masked_fill(mask, -1e9)

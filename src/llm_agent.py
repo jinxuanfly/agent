@@ -180,6 +180,14 @@ class LLMAgent:
         self.use_direct_image = use_direct_image
         self.verbose = verbose
         
+        # Agent类型索引（0=文本, 1=图像, 2=跨模态），用于Symbolic GAT
+        if 'image' in name.lower() or '图像' in name:
+            self._agent_type_idx = 1
+        elif '跨模态' in name or 'multimodal' in name.lower() or 'fusion' in name.lower():
+            self._agent_type_idx = 2
+        else:
+            self._agent_type_idx = 0
+        
         # 用于生成稳定embedding的投影层（将LLM输出+推理文本投影到固定维度）
         self._proj = torch.nn.Linear(num_classes + 1 + 32, embed_dim)
         
@@ -265,10 +273,28 @@ class LLMAgent:
             if word in reasoning:
                 reasoning_vec[idx] = 1.0
         
-        # 从LLM输出构造embedding: 拼接belief + uncertainty + 推理文本特征，投影到embed_dim
-        feat = torch.cat([belief, uncertainty.unsqueeze(0), reasoning_vec])
-        with torch.no_grad():
-            embedding = self._proj(feat)
+        # Symbolic GAT改进：使用有意义的符号特征填充embedding，而非随机投影
+        # 符号特征 = [belief, uncertainty, reasoning_vec, agent_type_onehot, label_onehot, confidence]
+        # 前44维是有意义的符号特征，其余补零到embed_dim
+        agent_type_onehot = torch.zeros(3)
+        agent_type_onehot[self._agent_type_idx] = 1.0  # 0=文本, 1=图像, 2=跨模态
+        label_onehot = torch.zeros(self.num_classes)
+        label_onehot[result['label']] = 1.0
+        conf_vec = torch.tensor([confidence])
+        
+        symbolic_feat = torch.cat([
+            belief,              # [C] 信念分布
+            uncertainty.unsqueeze(0),  # [1] 不确定性
+            reasoning_vec,       # [32] 推理词袋
+            agent_type_onehot,   # [3] Agent类型
+            label_onehot,        # [C] 预测label
+            conf_vec,            # [1] 置信度
+        ])  # 总维度: C + 1 + 32 + 3 + C + 1 = 2C + 37 = 41 (C=2)
+        
+        # 将符号特征填入embedding前几位，后面补零
+        embedding = torch.zeros(self.embed_dim)
+        actual_dim = min(symbolic_feat.shape[0], self.embed_dim)
+        embedding[:actual_dim] = symbolic_feat[:actual_dim]
         
         self.total_confidence += confidence
         

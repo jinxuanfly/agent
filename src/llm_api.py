@@ -67,8 +67,8 @@ def get_rate_limiter(provider: str, min_interval: float = 1.0) -> RateLimiter:
 
 PROVIDER_CONFIGS = {
     'deepseek': {
-        'base_url': 'https://api.deepseek.com/v1',
-        'default_model': 'deepseek-v4-flash',
+        'base_url': 'https://www.moyu.info/v1',
+        'default_model': 'deepseek-v4-pro',
         'env_key': 'DEEPSEEK_API_KEY',
         'headers': {'Content-Type': 'application/json'},
     },
@@ -91,11 +91,29 @@ PROVIDER_CONFIGS = {
         'env_key': 'OPENAI_API_KEY',
         'headers': {'Content-Type': 'application/json'},
     },
+    'gpt5': {
+        'base_url': 'https://www.moyu.info/v1',
+        'default_model': 'gpt-5',
+        'env_key': 'OPENAI_GPT5_API_KEY',
+        'headers': {'Content-Type': 'application/json'},
+        'is_reasoning_model': True,  # GPT-5是推理模型，需要特殊处理
+        'default_max_tokens': 2000,  # 推理模型需要更多token
+        'reasoning_effort': 'minimal',  # 减少推理token消耗
+    },
+    'gpt4om': {
+        'base_url': 'https://www.moyu.info/v1',
+        'default_model': 'gpt-4o-mini-2024-07-18',
+        'env_key': 'OPENAI_GPT4OM_API_KEY',
+        'headers': {'Content-Type': 'application/json'},
+    },
     'gemini': {
         'base_url': 'https://www.moyu.info/v1',
         'default_model': 'gemini-3.5-flash',
         'env_key': 'GEMINI_API_KEY',
         'headers': {'Content-Type': 'application/json'},
+        'is_reasoning_model': True,  # Gemini-3.5-flash也是推理模型
+        'default_max_tokens': 2000,
+        'reasoning_effort': 'minimal',
     },
     'claude': {
         'base_url': 'https://www.moyu.info/v1',
@@ -172,7 +190,33 @@ class LLMClient:
             min_call_interval: 最小调用间隔（秒），防止限流
         """
         if provider not in PROVIDER_CONFIGS:
-            raise ValueError(f"不支持的provider: {provider}，可选: {list(PROVIDER_CONFIGS.keys())}")
+            if provider == 'mock':
+                # Mock mode for testing
+                self.provider = 'mock'
+                self._config = {}
+                self.base_url = ''
+                self.model = 'mock'
+                self.api_key = ''
+                self.headers = {}
+                self.temperature = temperature
+                self.max_retries = 0
+                self.timeout = 1
+                
+                self.min_call_interval = min_call_interval
+                self._rate_limiter = None
+                self._last_call_time = 0
+                
+                self.mock_mode = True
+                self._allow_mock_fallback = True
+                self.call_count = 0
+                self.total_tokens = 0
+                self.total_cost = 0.0
+                self._session_id = None
+                self._cache = {}
+                self._last_error = None
+                return
+            else:
+                raise ValueError(f"不支持的provider: {provider}，可选: {list(PROVIDER_CONFIGS.keys())}")
 
         config = PROVIDER_CONFIGS[provider]
         self.provider = provider
@@ -229,6 +273,15 @@ class LLMClient:
         }
         if response_format:
             body["response_format"] = response_format
+
+        # GPT-5推理模型适配：自动添加reasoning_effort参数
+        if self._config.get('is_reasoning_model', False):
+            # 只有GPT-5支持reasoning_effort参数
+            if self.provider == 'gpt5':
+                body['reasoning_effort'] = self._config.get('reasoning_effort', 'minimal')
+            # 如果max_tokens太小，自动增大到默认值
+            if max_tokens < self._config.get('default_max_tokens', 2000):
+                body['max_tokens'] = self._config['default_max_tokens']
 
         url = f"{self.base_url}/chat/completions"
 
@@ -367,6 +420,13 @@ class LLMClient:
                 }
                 if response_format:
                     body["response_format"] = response_format
+
+                # GPT-5推理模型适配
+                if self._config.get('is_reasoning_model', False):
+                    if self.provider == 'gpt5':
+                        body['reasoning_effort'] = self._config.get('reasoning_effort', 'minimal')
+                    if max_tokens < self._config.get('default_max_tokens', 2000):
+                        body['max_tokens'] = self._config['default_max_tokens']
 
                 resp = requests.post(
                     url, headers=self.headers, json=body, timeout=self.timeout
