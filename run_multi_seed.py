@@ -25,7 +25,7 @@ from pathlib import Path
 SEEDS = [42, 123, 456, 789, 1024]
 DEFAULT_PROVIDER1 = 'deepseek'
 DEFAULT_PROVIDER2 = 'gemini'
-DEFAULT_PROVIDER3 = 'gpt5'
+DEFAULT_PROVIDER3 = 'gpt5.1'
 
 
 def run_experiment(seed, max_train, max_val, provider1, provider2, provider3, skip_llm_inference=False):

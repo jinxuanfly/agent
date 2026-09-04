@@ -122,7 +122,7 @@ def run_reflection_on_sample(agents, text, image_description, image,
 
 def main(max_disagree=100, providers=None):
     if providers is None:
-        providers = ['gpt5', 'gemini', 'gpt5']
+        providers = ['gpt5.1', 'gemini', 'gpt5.1']
 
     print("=" * 80)
     print("Step5 高效版：因果反事实反思（跨Agent证据交换）")
@@ -232,7 +232,7 @@ def main(max_disagree=100, providers=None):
             embed_dim=256,
             num_classes=NUM_CLASSES,
             use_image=(i >= 1),
-            use_direct_image=(i >= 1 and provider in ['glm', 'gpt', 'gpt5', 'gpt4om', 'gemini']),
+            use_direct_image=(i >= 1 and provider in ['glm', 'gpt', 'gpt5.1', 'gpt4om', 'gemini']),
             verbose=False,
         )
         agents.append(agent)
@@ -432,6 +432,6 @@ if __name__ == '__main__':
     parser.add_argument('--max_disagree', type=int, default=100, help='最大处理分歧样本数')
     parser.add_argument('--provider1', type=str, default='deepseek')
     parser.add_argument('--provider2', type=str, default='gemini')
-    parser.add_argument('--provider3', type=str, default='gpt5')
+    parser.add_argument('--provider3', type=str, default='gpt5.1')
     args = parser.parse_args()
     main(max_disagree=args.max_disagree, providers=[args.provider1, args.provider2, args.provider3])

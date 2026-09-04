@@ -960,7 +960,7 @@ def run_llm_evaluation(
     max_val=200,
     provider1='deepseek',
     provider2='gemini',
-    provider3='gpt5',
+    provider3='gpt5.1',
     seed=42,
     train_gat=True,
     enable_emnet=True,
@@ -1117,7 +1117,7 @@ def run_llm_evaluation(
                 timeout=180,
                 min_call_interval=0.0,
             )
-            use_direct_image = (i >= 1 and prov in ['glm', 'gpt', 'gpt5', 'gpt4om', 'gemini'])
+            use_direct_image = (i >= 1 and prov in ['glm', 'gpt', 'gpt5.1', 'gpt4om', 'gemini'])
             use_image_for_agent = (i >= 1)
             agent = LLMAgent(
                 client=client,
@@ -1147,7 +1147,7 @@ def run_llm_evaluation(
             client = LLMClient(
                 provider=prov, temperature=0.1, max_retries=2, timeout=60, min_call_interval=0.0,
             )
-            use_direct_image = (i >= 1 and prov in ['glm', 'gpt', 'gpt5', 'gpt4om', 'gemini'])
+            use_direct_image = (i >= 1 and prov in ['glm', 'gpt', 'gpt5.1', 'gpt4om', 'gemini'])
             use_image_for_agent = (i >= 1)
             agent = LLMAgent(
                 client=client, name=name, system_prompt=AGENT_PROMPTS.get(prompt_key),
@@ -2033,7 +2033,7 @@ if __name__ == '__main__':
     parser.add_argument('--provider2', type=str, default='gemini',
                         choices=list(PROVIDER_CONFIGS.keys()) + ['mock'],
                         help='Agent2模型提供者（图像专家）')
-    parser.add_argument('--provider3', type=str, default='gpt5',
+    parser.add_argument('--provider3', type=str, default='gpt5.1',
                         choices=list(PROVIDER_CONFIGS.keys()) + ['mock'],
                         help='Agent3模型提供者（跨模态专家）')
     parser.add_argument('--seed', type=int, default=42,

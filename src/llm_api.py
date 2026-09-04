@@ -85,16 +85,16 @@ PROVIDER_CONFIGS = {
         'env_key': 'GLM_API_KEY',
         'headers': {'Content-Type': 'application/json'},
     },
-    'gpt': {
+    # 'gpt': {
+    #     'base_url': 'https://www.moyu.info/v1',
+    #     'default_model': 'gpt-4o-mini-2024-07-18',
+    #     'env_key': 'OPENAI_API_KEY',
+    #     'headers': {'Content-Type': 'application/json'},
+    # },
+    'gpt5.1': {
         'base_url': 'https://www.moyu.info/v1',
-        'default_model': 'gpt-4o-mini-2024-07-18',
-        'env_key': 'OPENAI_API_KEY',
-        'headers': {'Content-Type': 'application/json'},
-    },
-    'gpt5': {
-        'base_url': 'https://www.moyu.info/v1',
-        'default_model': 'gpt-5',
-        'env_key': 'OPENAI_GPT5_API_KEY',
+        'default_model': 'gpt-5.1',
+        'env_key': 'OPENAI_GPT5.1_API_KEY',
         'headers': {'Content-Type': 'application/json'},
         'is_reasoning_model': True,  # GPT-5是推理模型，需要特殊处理
         'default_max_tokens': 2000,  # 推理模型需要更多token
@@ -277,7 +277,7 @@ class LLMClient:
         # GPT-5推理模型适配：自动添加reasoning_effort参数
         if self._config.get('is_reasoning_model', False):
             # 只有GPT-5支持reasoning_effort参数
-            if self.provider == 'gpt5':
+            if self.provider == 'gpt5.1':
                 body['reasoning_effort'] = self._config.get('reasoning_effort', 'minimal')
             # 如果max_tokens太小，自动增大到默认值
             if max_tokens < self._config.get('default_max_tokens', 2000):
@@ -423,7 +423,7 @@ class LLMClient:
 
                 # GPT-5推理模型适配
                 if self._config.get('is_reasoning_model', False):
-                    if self.provider == 'gpt5':
+                    if self.provider == 'gpt5.1':
                         body['reasoning_effort'] = self._config.get('reasoning_effort', 'minimal')
                     if max_tokens < self._config.get('default_max_tokens', 2000):
                         body['max_tokens'] = self._config['default_max_tokens']
